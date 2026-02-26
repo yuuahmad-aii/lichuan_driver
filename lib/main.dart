@@ -428,7 +428,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 ? const Center(child: Text('Menunggu data...'))
                                 : LineChart(
                                     LineChartData(
-                                      gridData: const FlGridData(show: true, drawVerticalLine: false),
+                                      gridData: const FlGridData(show: true, drawVerticalLine: true),
                                       titlesData: const FlTitlesData(
                                         leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, reservedSize: 50)),
                                         rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
