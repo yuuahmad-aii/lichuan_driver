@@ -1,28 +1,30 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_libserialport/flutter_libserialport.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:intl/intl.dart';
 
 void main() {
-  runApp(const MyApp());
+  runApp(const ModbusApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class ModbusApp extends StatelessWidget {
+  const ModbusApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'MPU6050 DAQ Viewer',
-      theme: ThemeData.dark().copyWith(
-        primaryColor: Colors.blueAccent,
-        scaffoldBackgroundColor: const Color(0xFF1E1E2C),
+      title: 'Modbus Positional Deviation',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueAccent),
+        useMaterial3: true,
       ),
       home: const DashboardScreen(),
-      debugShowCheckedModeBanner: false,
     );
   }
 }
@@ -35,371 +37,429 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  // Serial Port Variables
-  List<String> _availablePorts = [];
-  String? _selectedPort;
-  SerialPort? _serialPort;
-  SerialPortReader? _reader;
-  StreamSubscription? _subscription;
-  bool _isConnected = false;
+  // Serial Port variables
+  List<String> availablePorts = [];
+  String? selectedPort;
+  SerialPort? serialPort;
+  SerialPortReader? reader;
+  bool isConnected = false;
 
-  // Data Processing Variables
-  String _buffer = '';
-  final int _maxDataPoints = 200; // Jumlah titik yang ditampilkan di grafik
-  final List<FlSpot> _dataAx = [];
-  final List<FlSpot> _dataAy = [];
-  final List<FlSpot> _dataAz = [];
-  double _timeCounter = 0;
+  // Modbus Configuration
+  final int baudRate = 115200;
+  final int slaveId = 1; // Ubah jika ID Slave device Anda berbeda
+  final int startAddress = 0x01BE; // 446 (Lower 16-bit)
+  final int numRegisters = 2; // Mengambil 1BE dan 1BF
 
-  // ==== KONFIGURASI GRAFIK ====
-  // Sesuaikan nilai ini dengan output MPU6050 Anda.
-  // Jika output MPU6050 adalah RAW (mentah), rentangnya biasanya -32768 hingga +32767.
-  // Jika output sudah dikonversi ke satuan G, rentangnya biasanya -2.0 hingga +2.0 (atau -4 hingga 4).
-  final double _minY = -35000; 
-  final double _maxY = 35000;  
+  // Data & Chart variables
+  Timer? pollingTimer;
+  List<FlSpot> chartData = [];
+  double currentTime = 0; // X-axis (seconds)
+  int currentDeviation = 0; // Y-axis (Value)
+  final int maxDataPoints = 100; // Jumlah titik maksimal di grafik
 
-  // Logging Variables
-  bool _isLogging = false;
-  String? _selectedDirectory;
-  IOSink? _logFileSink;
-  int _logCount = 0;
+  // Logging variables
+  String? logDirectory;
+  File? logFile;
+  IOSink? logSink;
+  bool isLogging = false;
 
-  // UI Update Timer
-  Timer? _uiUpdateTimer;
+  // Modbus Buffer
+  List<int> rxBuffer = [];
 
   @override
   void initState() {
     super.initState();
     _refreshPorts();
-    
-    // Timer untuk merender grafik setiap 50ms (20 FPS)
-    _uiUpdateTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
-      if (_isConnected && mounted) {
-        setState(() {}); // Paksa refresh UI
-      }
-    });
   }
 
   @override
   void dispose() {
+    pollingTimer?.cancel();
     _disconnect();
-    _uiUpdateTimer?.cancel();
     super.dispose();
   }
 
   void _refreshPorts() {
     setState(() {
-      _availablePorts = SerialPort.availablePorts;
-      if (!_availablePorts.contains(_selectedPort)) {
-        _selectedPort = null;
+      availablePorts = SerialPort.availablePorts;
+      if (availablePorts.isNotEmpty) {
+        selectedPort = availablePorts.first;
       }
     });
   }
 
-  void _connect() {
-    if (_selectedPort == null) return;
+  Future<void> _connect() async {
+    if (selectedPort == null) return;
 
+    serialPort = SerialPort(selectedPort!);
+    
     try {
-      _serialPort = SerialPort(_selectedPort!);
-      if (!_serialPort!.openReadWrite()) {
-        _showError('Gagal membuka port $_selectedPort');
-        return;
+      if (serialPort!.openReadWrite()) {
+        // Konfigurasi 115200, 8E1
+        SerialPortConfig config = serialPort!.config;
+        config.baudRate = baudRate;
+        config.bits = 8;
+        config.parity = 2; // 2 biasanya mewakili Even Parity di libserialport
+        config.stopBits = 1;
+        serialPort!.config = config;
+
+        reader = SerialPortReader(serialPort!);
+        reader!.stream.listen(_handleIncomingData);
+
+        setState(() {
+          isConnected = true;
+          chartData.clear();
+          currentTime = 0;
+        });
+
+        // Polling data setiap 50 ms (20 Hz)
+        pollingTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
+          _sendModbusRequest();
+        });
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Terhubung ke $selectedPort')),
+        );
       }
-
-      SerialPortConfig config = _serialPort!.config;
-      config.baudRate = 115200;
-      _serialPort!.config = config;
-
-      _reader = SerialPortReader(_serialPort!);
-      _subscription = _reader!.stream.listen(_onDataReceived);
-
-      setState(() {
-        _isConnected = true;
-        _dataAx.clear();
-        _dataAy.clear();
-        _dataAz.clear();
-        _timeCounter = 0;
-      });
     } catch (e) {
-      _showError(e.toString());
-    }
-  }
-
-  void _disconnect() {
-    _stopLogging();
-    _subscription?.cancel();
-    _reader?.close();
-    if (_serialPort != null && _serialPort!.isOpen) {
-      _serialPort!.close();
-    }
-    setState(() {
-      _isConnected = false;
-    });
-  }
-
-  void _onDataReceived(List<int> data) {
-    // Menggunakan String.fromCharCodes lebih aman untuk data ASCII 
-    // berkecepatan tinggi dibanding utf8.decode untuk menghindari crash byte terputus
-    _buffer += String.fromCharCodes(data);
-    int index;
-    // Parsing per baris
-    while ((index = _buffer.indexOf('\n')) != -1) {
-      String line = _buffer.substring(0, index).trim();
-      _buffer = _buffer.substring(index + 1);
-      if (line.isNotEmpty) {
-        _processDataLine(line);
-      }
-    }
-  }
-
-  void _processDataLine(String line) {
-    // Simpan ke log jika sedang merekam
-    if (_isLogging && _logFileSink != null) {
-      _logFileSink!.writeln(line);
-      _logCount++;
-    }
-
-    // Pisahkan berdasarkan koma (ax,ay,az,gx,gy,gz)
-    List<String> parts = line.split(',');
-    if (parts.length >= 6) {
-      double? ax = double.tryParse(parts[0]);
-      double? ay = double.tryParse(parts[1]);
-      double? az = double.tryParse(parts[2]);
-
-      if (ax != null && ay != null && az != null) {
-        _timeCounter += 1;
-
-        _dataAx.add(FlSpot(_timeCounter, ax));
-        _dataAy.add(FlSpot(_timeCounter, ay));
-        _dataAz.add(FlSpot(_timeCounter, az));
-
-        // Buang data lama agar grafik memiliki efek "scrolling"
-        if (_dataAx.length > _maxDataPoints) {
-          _dataAx.removeAt(0);
-          _dataAy.removeAt(0);
-          _dataAz.removeAt(0);
-        }
-      }
-    }
-  }
-
-  Future<void> _pickDirectory() async {
-    String? result = await FilePicker.platform.getDirectoryPath();
-    if (result != null) {
-      setState(() {
-        _selectedDirectory = result;
-      });
-    }
-  }
-
-  void _startLogging() {
-    if (_selectedDirectory == null) {
-      _showError('Pilih folder penyimpanan terlebih dahulu!');
-      return;
-    }
-    
-    String timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').split('.')[0];
-    String fileName = '$_selectedDirectory\\log_mpu6050_$timestamp.csv';
-    
-    File file = File(fileName);
-    _logFileSink = file.openWrite();
-    _logFileSink!.writeln('ax,ay,az,gx,gy,gz');
-    
-    setState(() {
-      _isLogging = true;
-      _logCount = 0;
-    });
-  }
-
-  void _stopLogging() async {
-    if (_isLogging) {
-      setState(() {
-        _isLogging = false;
-      });
-      await _logFileSink?.flush();
-      await _logFileSink?.close();
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Log disimpan. Total data: $_logCount baris')),
+        SnackBar(content: Text('Gagal terhubung: $e')),
       );
     }
   }
 
-  void _showError(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message, style: const TextStyle(color: Colors.white)), backgroundColor: Colors.red),
+  void _disconnect() {
+    pollingTimer?.cancel();
+    if (isLogging) _stopLogging();
+    
+    reader?.close();
+    if (serialPort != null && serialPort!.isOpen) {
+      serialPort!.close();
+    }
+    serialPort?.dispose();
+    
+    setState(() {
+      isConnected = false;
+    });
+  }
+
+  void _sendModbusRequest() {
+    if (serialPort == null || !serialPort!.isOpen) return;
+
+    // Modbus RTU Read Holding Registers (FC 03) Frame
+    var frame = ByteData(6);
+    frame.setUint8(0, slaveId);
+    frame.setUint8(1, 3); // Function Code 03
+    frame.setUint16(2, startAddress, Endian.big);
+    frame.setUint16(4, numRegisters, Endian.big);
+
+    int crc = _calculateCRC(frame.buffer.asUint8List());
+    var fullFrame = BytesBuilder();
+    fullFrame.add(frame.buffer.asUint8List());
+    fullFrame.addByte(crc & 0xFF);     // CRC Low
+    fullFrame.addByte((crc >> 8) & 0xFF); // CRC High
+
+    serialPort!.write(fullFrame.toBytes());
+  }
+
+  void _handleIncomingData(Uint8List data) {
+    rxBuffer.addAll(data);
+
+    // Respons untuk FC03, baca 2 register adalah 9 byte:
+    // [ID(1), FC(1), ByteCount(1), DataHigh(2), DataLow(2), CRCLow(1), CRCHigh(1)]
+    if (rxBuffer.length >= 9) {
+      // Ekstrak data (mengasumsikan frame yang valid untuk disederhanakan)
+      int byteCount = rxBuffer[2];
+      if (byteCount == 4) {
+        // Register 1BE (Lower 16 bit) berada di urutan data pertama (byte 3 & 4)
+        int lowWord = (rxBuffer[3] << 8) | rxBuffer[4];
+        // Register 1BF (Higher 16 bit) berada di urutan data kedua (byte 5 & 6)
+        int highWord = (rxBuffer[5] << 8) | rxBuffer[6];
+
+        // Gabungkan menjadi 32-bit (Signed Integer)
+        int combined = (highWord << 16) | lowWord;
+        
+        // Konversi ke signed 32-bit (jika bernilai negatif)
+        if ((combined & 0x80000000) != 0) {
+          combined = combined - 0x100000000;
+        }
+
+        setState(() {
+          currentDeviation = combined;
+          currentTime += 0.05; // Tambah 50ms
+          
+          chartData.add(FlSpot(currentTime, currentDeviation.toDouble()));
+          if (chartData.length > maxDataPoints) {
+            chartData.removeAt(0); // Hapus data terlama agar grafik bergeser
+          }
+        });
+
+        // Simpan ke log file jika sedang merekam
+        if (isLogging && logSink != null) {
+          String timestamp = DateFormat('yyyy-MM-dd HH:mm:ss.SSS').format(DateTime.now());
+          logSink!.writeln('$timestamp,$currentDeviation');
+        }
+      }
+      
+      // Bersihkan buffer setelah diproses
+      rxBuffer.clear();
+    }
+  }
+
+  int _calculateCRC(Uint8List data) {
+    int crc = 0xFFFF;
+    for (int i = 0; i < data.length; i++) {
+      crc ^= data[i];
+      for (int j = 0; j < 8; j++) {
+        if ((crc & 1) != 0) {
+          crc = (crc >> 1) ^ 0xA001;
+        } else {
+          crc = crc >> 1;
+        }
+      }
+    }
+    return crc;
+  }
+
+  Future<void> _selectFolder() async {
+    String? selectedDirectory = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Pilih Folder untuk Menyimpan Log',
     );
+
+    if (selectedDirectory != null) {
+      setState(() {
+        logDirectory = selectedDirectory;
+      });
+    }
+  }
+
+  void _toggleLogging() {
+    if (isLogging) {
+      _stopLogging();
+    } else {
+      _startLogging();
+    }
+  }
+
+  void _startLogging() {
+    if (logDirectory == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Pilih folder log terlebih dahulu!')),
+      );
+      return;
+    }
+
+    String fileName = 'Log_Deviation_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}.csv';
+    logFile = File('$logDirectory\\$fileName');
+    logSink = logFile!.openWrite();
+    
+    // Tulis Header CSV
+    logSink!.writeln('Timestamp,Positional_Deviation');
+
+    setState(() {
+      isLogging = true;
+    });
+  }
+
+  Future<void> _stopLogging() async {
+    // 1. Matikan flag logging TERLEBIH DAHULU agar _handleIncomingData langsung berhenti menulis
+    setState(() {
+      isLogging = false;
+    });
+
+    // 2. Tutup file dengan aman menggunakan await (asynchronous)
+    try {
+      await logSink?.flush();
+      await logSink?.close();
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error saat menutup file log: $e');
+      }
+    }
+    
+    logSink = null;
+
+    // 3. Tampilkan notifikasi jika widget masih aktif
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Log disimpan di: ${logFile?.path}')),
+      );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('MPU6050 Vibration DAQ (1kHz)'),
-        backgroundColor: const Color(0xFF2C2C3E),
+        title: const Text('Modbus Positional Deviation Monitor', style: TextStyle(fontWeight: FontWeight.bold)),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: _isConnected ? null : _refreshPorts,
+            onPressed: isConnected ? null : _refreshPorts,
             tooltip: 'Refresh COM Ports',
-          ),
+          )
         ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
         child: Column(
           children: [
-            // TOP PANEL: Koneksi Port Serial
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(color: const Color(0xFF2C2C3E), borderRadius: BorderRadius.circular(8)),
-              child: Row(
-                children: [
-                  const Text('COM Port: ', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                  const SizedBox(width: 10),
-                  DropdownButton<String>(
-                    value: _selectedPort,
-                    hint: const Text('Pilih Port'),
-                    items: _availablePorts.map((String port) {
-                      return DropdownMenuItem<String>(value: port, child: Text(port));
-                    }).toList(),
-                    onChanged: _isConnected ? null : (val) => setState(() => _selectedPort = val),
-                  ),
-                  const Spacer(),
-                  ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: _isConnected ? Colors.redAccent : Colors.green,
-                    ),
-                    onPressed: _isConnected ? _disconnect : _connect,
-                    child: Text(_isConnected ? 'Disconnect' : 'Connect'),
-                  ),
-                ],
-              ),
-            ),
-            
-            const SizedBox(height: 16),
-            
-            // MIDDLE PANEL: Grafik Real-Time
-            Expanded(
-              child: Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(color: const Color(0xFF2C2C3E), borderRadius: BorderRadius.circular(8)),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
+            // BARIS ATAS: KONTROL KONEKSI
+            Card(
+              elevation: 4,
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Row(
                   children: [
-                    const Text('Grafik Akselerasi Real-Time (X: Merah, Y: Hijau, Z: Biru)', 
-                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                    const SizedBox(height: 16),
+                    const Icon(Icons.usb, size: 30),
+                    const SizedBox(width: 16),
                     Expanded(
-                      child: _dataAx.isEmpty 
-                        ? const Center(child: Text('Menunggu data...'))
-                        : LineChart(
-                            LineChartData(
-                              // PERBAIKAN 1: Mencegah grafik sumbu X bergetar (Auto-scale X dimatikan)
-                              minX: _dataAx.first.x,
-                              maxX: _dataAx.first.x + _maxDataPoints,
-                              
-                              // PERBAIKAN 2: Mencegah grafik sumbu Y bergetar (Auto-scale Y dimatikan)
-                              minY: _minY, 
-                              maxY: _maxY, 
-
-                              gridData: FlGridData(show: true, drawVerticalLine: false),
-                              titlesData: FlTitlesData(
-                                leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, reservedSize: 50)),
-                                rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                                topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                                bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                              ),
-                              borderData: FlBorderData(show: true, border: Border.all(color: Colors.grey.withAlpha(200))),
-                              lineBarsData: [
-                                // Line Akselerasi X
-                                LineChartBarData(
-                                  spots: _dataAx,
-                                  isCurved: false,
-                                  color: Colors.redAccent,
-                                  barWidth: 2,
-                                  dotData: FlDotData(show: false),
-                                ),
-                                // Line Akselerasi Y
-                                LineChartBarData(
-                                  spots: _dataAy,
-                                  isCurved: false,
-                                  color: Colors.greenAccent,
-                                  barWidth: 2,
-                                  dotData: FlDotData(show: false),
-                                ),
-                                // Line Akselerasi Z
-                                LineChartBarData(
-                                  spots: _dataAz,
-                                  isCurved: false,
-                                  color: Colors.lightBlueAccent,
-                                  barWidth: 2,
-                                  dotData: FlDotData(show: false),
-                                ),
-                              ],
-                            ),
-                          ),
+                      child: DropdownButtonFormField<String>(
+                        initialValue: selectedPort,
+                        decoration: const InputDecoration(labelText: 'Pilih COM Port'),
+                        items: availablePorts.map((port) {
+                          return DropdownMenuItem(value: port, child: Text(port));
+                        }).toList(),
+                        onChanged: isConnected ? null : (val) => setState(() => selectedPort = val),
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    const Text('115200 8E1', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
+                    const SizedBox(width: 24),
+                    ElevatedButton.icon(
+                      onPressed: isConnected ? _disconnect : _connect,
+                      icon: Icon(isConnected ? Icons.stop : Icons.play_arrow),
+                      label: Text(isConnected ? 'Disconnect' : 'Connect'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: isConnected ? Colors.red.shade100 : Colors.green.shade100,
+                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16)
+                      ),
                     ),
                   ],
                 ),
               ),
             ),
-            
             const SizedBox(height: 16),
-            
-            // BOTTOM PANEL: Data Logging
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(color: const Color(0xFF2C2C3E), borderRadius: BorderRadius.circular(8)),
-              child: Column(
+
+            // BARIS TENGAH: DISPLAY NILAI & GRAFIK
+            Expanded(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Row(
-                    children: [
-                      ElevatedButton.icon(
-                        icon: const Icon(Icons.folder),
-                        label: const Text('Pilih Folder'),
-                        onPressed: _isLogging ? null : _pickDirectory,
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Text(
-                          _selectedDirectory == null ? 'Folder belum dipilih' : _selectedDirectory!,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(color: Colors.grey[400]),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.blueAccent,
-                            padding: const EdgeInsets.symmetric(vertical: 16),
+                  // PANEL KIRI: NILAI AKTUAL & LOGGER
+                  Expanded(
+                    flex: 1,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Card(
+                          elevation: 4,
+                          color: Theme.of(context).colorScheme.primaryContainer,
+                          child: Padding(
+                            padding: const EdgeInsets.all(24.0),
+                            child: Column(
+                              children: [
+                                const Text('Current Positional Deviation', style: TextStyle(fontSize: 16)),
+                                const SizedBox(height: 16),
+                                Text(
+                                  isConnected ? currentDeviation.toString() : '---',
+                                  style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold),
+                                ),
+                              ],
+                            ),
                           ),
-                          icon: const Icon(Icons.play_circle_fill),
-                          label: const Text('Mulai Log Data', style: TextStyle(fontSize: 16)),
-                          onPressed: (!_isConnected || _isLogging) ? null : _startLogging,
                         ),
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.redAccent,
-                            padding: const EdgeInsets.symmetric(vertical: 16),
+                        const SizedBox(height: 16),
+                        Card(
+                          elevation: 4,
+                          child: Padding(
+                            padding: const EdgeInsets.all(16.0),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('Data Logging', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                const Divider(),
+                                Text(logDirectory != null ? 'Folder: $logDirectory' : 'Folder belum dipilih', 
+                                     style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                                const SizedBox(height: 12),
+                                ElevatedButton.icon(
+                                  onPressed: isLogging ? null : _selectFolder,
+                                  icon: const Icon(Icons.folder),
+                                  label: const Text('Pilih Folder'),
+                                ),
+                                const SizedBox(height: 12),
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: ElevatedButton.icon(
+                                    onPressed: (!isConnected || logDirectory == null) ? null : _toggleLogging,
+                                    icon: Icon(isLogging ? Icons.stop_circle : Icons.fiber_manual_record),
+                                    label: Text(isLogging ? 'Berhenti Rekam' : 'Mulai Rekam'),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: isLogging ? Colors.red : Colors.green,
+                                      foregroundColor: Colors.white,
+                                      padding: const EdgeInsets.symmetric(vertical: 16)
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
-                          icon: const Icon(Icons.stop_circle),
-                          label: const Text('Hentikan Log', style: TextStyle(fontSize: 16)),
-                          onPressed: _isLogging ? _stopLogging : null,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  
+                  // PANEL KANAN: GRAFIK
+                  Expanded(
+                    flex: 3,
+                    child: Card(
+                      elevation: 4,
+                      child: Padding(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            const Text('Grafik Real-time', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 16),
+                            Expanded(
+                              child: chartData.isEmpty 
+                                ? const Center(child: Text('Menunggu data...'))
+                                : LineChart(
+                                    LineChartData(
+                                      gridData: const FlGridData(show: true, drawVerticalLine: false),
+                                      titlesData: const FlTitlesData(
+                                        leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, reservedSize: 50)),
+                                        rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                                        topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                                        bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)), // Sembunyikan sumbu X (waktu)
+                                      ),
+                                      borderData: FlBorderData(show: true),
+                                      lineBarsData: [
+                                        LineChartBarData(
+                                          spots: chartData,
+                                          isCurved: false, // Ubah ke false agar grafik akurat (tidak ada smoothing/melengkung tak karuan)
+                                          color: Colors.blue,
+                                          barWidth: 2,
+                                          // isStrokeCapRound: true,
+                                          dotData: const FlDotData(show: false),
+                                          // belowBarData: BarAreaData(
+                                          //   show: true, 
+                                          //   color: Colors.blue.withAlpha(200)
+                                          // ),
+                                        ),
+                                      ],
+                                      minX: chartData.first.x,
+                                      maxX: chartData.last.x,
+                                    ),
+                                  ),
+                            ),
+                          ],
                         ),
                       ),
-                    ],
+                    ),
                   ),
-                  const SizedBox(height: 8),
-                  if (_isLogging)
-                    Text('Merekam... ($_logCount baris data)', style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
                 ],
               ),
             ),
