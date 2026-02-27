@@ -46,16 +46,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   // Modbus Configuration
   final int baudRate = 115200;
-  final int slaveId = 1; // Ubah jika ID Slave device Anda berbeda
-  final int startAddress = 0x01BE; // 446 (Lower 16-bit)
-  final int numRegisters = 2; // Mengambil 1BE dan 1BF
+  final int slaveId = 1; 
+  final int startAddress = 0x01BE; 
+  final int numRegisters = 2; 
 
   // Data & Chart variables
   Timer? pollingTimer;
+  Timer? uiUpdateTimer; // Timer terpisah untuk update UI agar tidak hang
+  
   List<FlSpot> chartData = [];
-  double currentTime = 0; // X-axis (seconds)
-  int currentDeviation = 0; // Y-axis (Value)
-  final int maxDataPoints = 100; // Jumlah titik maksimal di grafik
+  double currentTime = 0; 
+  int currentDeviation = 0; 
+  final int maxDataPoints = 100; 
 
   // Logging variables
   String? logDirectory;
@@ -75,6 +77,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void dispose() {
     pollingTimer?.cancel();
+    uiUpdateTimer?.cancel();
     _disconnect();
     super.dispose();
   }
@@ -92,14 +95,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (selectedPort == null) return;
 
     serialPort = SerialPort(selectedPort!);
-    
+
     try {
       if (serialPort!.openReadWrite()) {
-        // Konfigurasi 115200, 8E1
         SerialPortConfig config = serialPort!.config;
         config.baudRate = baudRate;
         config.bits = 8;
-        config.parity = 2; // 2 biasanya mewakili Even Parity di libserialport
+        config.parity = 2; 
         config.stopBits = 1;
         serialPort!.config = config;
 
@@ -110,34 +112,43 @@ class _DashboardScreenState extends State<DashboardScreen> {
           isConnected = true;
           chartData.clear();
           currentTime = 0;
+          rxBuffer.clear(); // Bersihkan buffer saat mulai
         });
 
-        // Polling data setiap 50 ms (20 Hz)
+        // 1. Timer untuk POLLING DATA ke alat (50ms / 20Hz)
         pollingTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
           _sendModbusRequest();
         });
-        
+
+        // 2. Timer untuk UPDATE UI (100ms / 10Hz) -> MENCEGAH HANG
+        uiUpdateTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+          if (mounted && isConnected) {
+            setState(() {
+              // Rebuild UI hanya terjadi disini, terpisah dari penerimaan data
+            });
+          }
+        });
+
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Terhubung ke $selectedPort')),
-        );
+            SnackBar(content: Text('Terhubung ke $selectedPort')));
       }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Gagal terhubung: $e')),
-      );
+          SnackBar(content: Text('Gagal terhubung: $e')));
     }
   }
 
   void _disconnect() {
     pollingTimer?.cancel();
+    uiUpdateTimer?.cancel();
     if (isLogging) _stopLogging();
-    
+
     reader?.close();
     if (serialPort != null && serialPort!.isOpen) {
       serialPort!.close();
     }
     serialPort?.dispose();
-    
+
     setState(() {
       isConnected = false;
     });
@@ -146,63 +157,72 @@ class _DashboardScreenState extends State<DashboardScreen> {
   void _sendModbusRequest() {
     if (serialPort == null || !serialPort!.isOpen) return;
 
-    // Modbus RTU Read Holding Registers (FC 03) Frame
     var frame = ByteData(6);
     frame.setUint8(0, slaveId);
-    frame.setUint8(1, 3); // Function Code 03
+    frame.setUint8(1, 3); 
     frame.setUint16(2, startAddress, Endian.big);
     frame.setUint16(4, numRegisters, Endian.big);
 
     int crc = _calculateCRC(frame.buffer.asUint8List());
     var fullFrame = BytesBuilder();
     fullFrame.add(frame.buffer.asUint8List());
-    fullFrame.addByte(crc & 0xFF);     // CRC Low
-    fullFrame.addByte((crc >> 8) & 0xFF); // CRC High
+    fullFrame.addByte(crc & 0xFF); 
+    fullFrame.addByte((crc >> 8) & 0xFF); 
 
-    serialPort!.write(fullFrame.toBytes());
+    try {
+      serialPort!.write(fullFrame.toBytes());
+    } catch (e) {
+      if (kDebugMode) print("Write error: $e");
+    }
   }
 
   void _handleIncomingData(Uint8List data) {
     rxBuffer.addAll(data);
 
-    // Respons untuk FC03, baca 2 register adalah 9 byte:
-    // [ID(1), FC(1), ByteCount(1), DataHigh(2), DataLow(2), CRCLow(1), CRCHigh(1)]
-    if (rxBuffer.length >= 9) {
-      // Ekstrak data (mengasumsikan frame yang valid untuk disederhanakan)
-      int byteCount = rxBuffer[2];
-      if (byteCount == 4) {
-        // Register 1BE (Lower 16 bit) berada di urutan data pertama (byte 3 & 4)
-        int lowWord = (rxBuffer[3] << 8) | rxBuffer[4];
-        // Register 1BF (Higher 16 bit) berada di urutan data kedua (byte 5 & 6)
-        int highWord = (rxBuffer[5] << 8) | rxBuffer[6];
-
-        // Gabungkan menjadi 32-bit (Signed Integer)
-        int combined = (highWord << 16) | lowWord;
+    // Gunakan WHILE loop untuk memproses semua frame yang mungkin menumpuk di buffer
+    // Jangan gunakan rxBuffer.clear() agar data yang belum lengkap tidak terbuang
+    while (rxBuffer.length >= 9) {
+      // Cek apakah byte pertama adalah header yang benar (ID dan FC03)
+      if (rxBuffer[0] == slaveId && rxBuffer[1] == 3 && rxBuffer[2] == 4) {
         
-        // Konversi ke signed 32-bit (jika bernilai negatif)
-        if ((combined & 0x80000000) != 0) {
-          combined = combined - 0x100000000;
-        }
+        // --- VALIDASI CRC UNTUK MENCEGAH DATA SAMPAH MERUSAK PROGRAM ---
+        int receivedCrc = rxBuffer[7] | (rxBuffer[8] << 8);
+        int calculatedCrc = _calculateCRC(Uint8List.fromList(rxBuffer.sublist(0, 7)));
 
-        setState(() {
+        if (receivedCrc == calculatedCrc) {
+          // Data Valid! Ekstrak nilai
+          int lowWord = (rxBuffer[3] << 8) | rxBuffer[4];
+          int highWord = (rxBuffer[5] << 8) | rxBuffer[6];
+
+          int combined = (highWord << 16) | lowWord;
+          if ((combined & 0x80000000) != 0) {
+            combined = combined - 0x100000000;
+          }
+
+          // UPDATE DATA SECARA SILENT (TANPA setState)
           currentDeviation = combined;
-          currentTime += 0.05; // Tambah 50ms
-          
+          currentTime += 0.05; 
+
           chartData.add(FlSpot(currentTime, currentDeviation.toDouble()));
           if (chartData.length > maxDataPoints) {
-            chartData.removeAt(0); // Hapus data terlama agar grafik bergeser
+            chartData.removeAt(0); 
           }
-        });
 
-        // Simpan ke log file jika sedang merekam
-        if (isLogging && logSink != null) {
-          String timestamp = DateFormat('yyyy-MM-dd HH:mm:ss.SSS').format(DateTime.now());
-          logSink!.writeln('$timestamp,$currentDeviation');
+          if (isLogging && logSink != null) {
+            String timestamp = DateFormat('yyyy-MM-dd HH:mm:ss.SSS').format(DateTime.now());
+            logSink!.writeln('$timestamp,$currentDeviation');
+          }
+
+          // Buang 1 frame (9 byte) yang sudah berhasil diproses dari buffer
+          rxBuffer.removeRange(0, 9);
+        } else {
+          // Jika CRC salah, buang 1 byte pertama agar loop mencari header berikutnya
+          rxBuffer.removeAt(0);
         }
+      } else {
+        // Jika bukan header yang valid, buang 1 byte pertama dan cari lagi
+        rxBuffer.removeAt(0);
       }
-      
-      // Bersihkan buffer setelah diproses
-      rxBuffer.clear();
     }
   }
 
@@ -252,8 +272,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     String fileName = 'Log_Deviation_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}.csv';
     logFile = File('$logDirectory\\$fileName');
     logSink = logFile!.openWrite();
-    
-    // Tulis Header CSV
+
     logSink!.writeln('Timestamp,Positional_Deviation');
 
     setState(() {
@@ -262,12 +281,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Future<void> _stopLogging() async {
-    // 1. Matikan flag logging TERLEBIH DAHULU agar _handleIncomingData langsung berhenti menulis
     setState(() {
       isLogging = false;
     });
 
-    // 2. Tutup file dengan aman menggunakan await (asynchronous)
     try {
       await logSink?.flush();
       await logSink?.close();
@@ -276,10 +293,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
         print('Error saat menutup file log: $e');
       }
     }
-    
+
     logSink = null;
 
-    // 3. Tampilkan notifikasi jika widget masih aktif
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Log disimpan di: ${logFile?.path}')),
@@ -291,14 +307,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Modbus Positional Deviation Monitor', style: TextStyle(fontWeight: FontWeight.bold)),
+        title: const Text(
+          'Modbus Positional Deviation Monitor',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: isConnected ? null : _refreshPorts,
             tooltip: 'Refresh COM Ports',
-          )
+          ),
         ],
       ),
       body: Padding(
@@ -317,23 +336,41 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     Expanded(
                       child: DropdownButtonFormField<String>(
                         initialValue: selectedPort,
-                        decoration: const InputDecoration(labelText: 'Pilih COM Port'),
+                        decoration: const InputDecoration(
+                          labelText: 'Pilih COM Port',
+                        ),
                         items: availablePorts.map((port) {
-                          return DropdownMenuItem(value: port, child: Text(port));
+                          return DropdownMenuItem(
+                            value: port,
+                            child: Text(port),
+                          );
                         }).toList(),
-                        onChanged: isConnected ? null : (val) => setState(() => selectedPort = val),
+                        onChanged: isConnected
+                            ? null
+                            : (val) => setState(() => selectedPort = val),
                       ),
                     ),
                     const SizedBox(width: 16),
-                    const Text('115200 8E1', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
+                    const Text(
+                      '115200 8E1',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: Colors.grey,
+                      ),
+                    ),
                     const SizedBox(width: 24),
                     ElevatedButton.icon(
                       onPressed: isConnected ? _disconnect : _connect,
                       icon: Icon(isConnected ? Icons.stop : Icons.play_arrow),
                       label: Text(isConnected ? 'Disconnect' : 'Connect'),
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: isConnected ? Colors.red.shade100 : Colors.green.shade100,
-                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16)
+                        backgroundColor: isConnected
+                            ? Colors.red.shade100
+                            : Colors.green.shade100,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 24,
+                          vertical: 16,
+                        ),
                       ),
                     ),
                   ],
@@ -360,11 +397,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             padding: const EdgeInsets.all(24.0),
                             child: Column(
                               children: [
-                                const Text('Current Positional Deviation', style: TextStyle(fontSize: 16)),
+                                const Text(
+                                  'Current Positional Deviation',
+                                  style: TextStyle(fontSize: 16),
+                                ),
                                 const SizedBox(height: 16),
                                 Text(
-                                  isConnected ? currentDeviation.toString() : '---',
-                                  style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold),
+                                  isConnected
+                                      ? currentDeviation.toString()
+                                      : '---',
+                                  style: const TextStyle(
+                                    fontSize: 48,
+                                    fontWeight: FontWeight.bold,
+                                  ),
                                 ),
                               ],
                             ),
@@ -378,10 +423,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                const Text('Data Logging', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                const Text(
+                                  'Data Logging',
+                                  style: TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
                                 const Divider(),
-                                Text(logDirectory != null ? 'Folder: $logDirectory' : 'Folder belum dipilih', 
-                                     style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                                Text(
+                                  logDirectory != null
+                                      ? 'Folder: $logDirectory'
+                                      : 'Folder belum dipilih',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.grey,
+                                  ),
+                                ),
                                 const SizedBox(height: 12),
                                 ElevatedButton.icon(
                                   onPressed: isLogging ? null : _selectFolder,
@@ -392,13 +450,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 SizedBox(
                                   width: double.infinity,
                                   child: ElevatedButton.icon(
-                                    onPressed: (!isConnected || logDirectory == null) ? null : _toggleLogging,
-                                    icon: Icon(isLogging ? Icons.stop_circle : Icons.fiber_manual_record),
-                                    label: Text(isLogging ? 'Berhenti Rekam' : 'Mulai Rekam'),
+                                    onPressed:
+                                        (!isConnected || logDirectory == null)
+                                        ? null
+                                        : _toggleLogging,
+                                    icon: Icon(
+                                      isLogging
+                                          ? Icons.stop_circle
+                                          : Icons.fiber_manual_record,
+                                    ),
+                                    label: Text(
+                                      isLogging
+                                          ? 'Berhenti Rekam'
+                                          : 'Mulai Rekam',
+                                    ),
                                     style: ElevatedButton.styleFrom(
-                                      backgroundColor: isLogging ? Colors.red : Colors.green,
+                                      backgroundColor: isLogging
+                                          ? Colors.red
+                                          : Colors.green,
                                       foregroundColor: Colors.white,
-                                      padding: const EdgeInsets.symmetric(vertical: 16)
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 16,
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -410,7 +483,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
                   ),
                   const SizedBox(width: 16),
-                  
+
                   // PANEL KANAN: GRAFIK
                   Expanded(
                     flex: 3,
@@ -421,39 +494,66 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            const Text('Grafik Real-time', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                            const Text(
+                              'Grafik Real-time',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
                             const SizedBox(height: 16),
                             Expanded(
-                              child: chartData.isEmpty 
-                                ? const Center(child: Text('Menunggu data...'))
-                                : LineChart(
-                                    LineChartData(
-                                      gridData: const FlGridData(show: true, drawVerticalLine: true),
-                                      titlesData: const FlTitlesData(
-                                        leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, reservedSize: 50)),
-                                        rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                                        topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                                        bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)), // Sembunyikan sumbu X (waktu)
-                                      ),
-                                      borderData: FlBorderData(show: true),
-                                      lineBarsData: [
-                                        LineChartBarData(
-                                          spots: chartData,
-                                          isCurved: false, // Ubah ke false agar grafik akurat (tidak ada smoothing/melengkung tak karuan)
-                                          color: Colors.blue,
-                                          barWidth: 2,
-                                          // isStrokeCapRound: true,
-                                          dotData: const FlDotData(show: false),
-                                          // belowBarData: BarAreaData(
-                                          //   show: true, 
-                                          //   color: Colors.blue.withAlpha(200)
-                                          // ),
+                              child: chartData.isEmpty
+                                  ? const Center(
+                                      child: Text('Menunggu data...'),
+                                    )
+                                  : LineChart(
+                                      LineChartData(
+                                        gridData: const FlGridData(
+                                          show: true,
+                                          drawVerticalLine: true,
                                         ),
-                                      ],
-                                      minX: chartData.first.x,
-                                      maxX: chartData.last.x,
+                                        titlesData: const FlTitlesData(
+                                          leftTitles: AxisTitles(
+                                            sideTitles: SideTitles(
+                                              showTitles: true,
+                                              reservedSize: 50,
+                                            ),
+                                          ),
+                                          rightTitles: AxisTitles(
+                                            sideTitles: SideTitles(
+                                              showTitles: false,
+                                            ),
+                                          ),
+                                          topTitles: AxisTitles(
+                                            sideTitles: SideTitles(
+                                              showTitles: false,
+                                            ),
+                                          ),
+                                          bottomTitles: AxisTitles(
+                                            sideTitles: SideTitles(
+                                              showTitles: false,
+                                            ),
+                                          ), 
+                                        ),
+                                        borderData: FlBorderData(show: true),
+                                        lineBarsData: [
+                                          LineChartBarData(
+                                            spots: chartData,
+                                            isCurved: false, 
+                                            color: Colors.blue,
+                                            barWidth: 2,
+                                            dotData: const FlDotData(
+                                              show: false,
+                                            ),
+                                          ),
+                                        ],
+                                        minX: chartData.first.x,
+                                        maxX: chartData.last.x,
+                                        minY: -50,
+                                        maxY: 50,
+                                      ),
                                     ),
-                                  ),
                             ),
                           ],
                         ),
